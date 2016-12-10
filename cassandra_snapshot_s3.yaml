@@ -1,0 +1,97 @@
+# Cassandra S3 Backup 
+# Tristan Watson
+# Dependancies:
+#  - EC2 Script
+#  - Archive Module (External)
+#  - Python-boto on targets
+
+- name: cassandra snapshot aws
+  vars:
+    - data_directory: "Undef"
+    - schema_file: "cassandra_schema.cdl"
+    - backup_bucket: "Undef"
+    - ansible_ec2_placement_region: eu-central-1
+    # Ansible-Vault is the better way to do this
+    - specify_access_key: "Undef"
+    - specify_secret_key: "Undef"
+    - cassandra_cluster_EC2_tag: "Undef"
+  remote_user: root
+  hosts: {{ cassandra_cluster_EC2_tag }} 
+  tasks:
+
+    - name: ping nodes to check for life
+      ping: 
+
+    - name: install python-boto
+      apt:
+        name: python-boto
+        state: present
+
+    - name: get the EC2 Facts
+      action: ec2_facts
+
+    - name: check service status
+      command: systemctl status cassandra
+
+    - name: check cassandra version
+      command: cassandra -v
+      register: version
+
+    - name: store EC2 instance Name
+      ec2_tag:
+        access_key: "{{ specify_access_key }}"
+        secret_key: "{{ specify_secret_key }}"
+        region: "{{ ansible_ec2_placement_region }}"
+        resource: "{{ ansible_ec2_instance_id }}"
+        state: list
+      register: ec2_tag
+
+    - name: print cassandra version
+      debug: "msg='Cassandra Version: {{ version.stdout }}'"
+
+    - name: snapshot all cassnadra keyspaces, tag with 'date'
+      command: nodetool -h localhost -p 7199 snapshot -t {{ ansible_date_time.date }}
+      register: snapshot
+
+    - name: backup cassandra database schema
+      shell: cqlsh -u cassandra -p cassandra {{ ansible_default_ipv4.address }} -e "DESCRIBE SCHEMA" > /space/{{ schema_file }}
+
+    - name: find all keyspace directories
+      find:
+        file_type: directory
+        recurse: no
+        path: "{{ data_directory }}"
+      register: cassandra_keyspaces
+
+    - name: find all directories with name 'date'
+      find:
+        file_type: directory
+        recurse: yes
+        path: "{{ item.path }}" 
+        get_checksum: true
+        patterns: "{{ ansible_date_time.date }}"
+      with_items: "{{ cassandra_keyspaces.files }}" 
+      register: cassandra_snapshot_directories 
+
+    - name: compress the directories
+      archive:
+        path: "{{ item.1.path }}"
+        format: gz
+        dest: "{{ item.1.path }}-snapshots.tar.gz"
+      with_subelements: 
+        - "{{ cassandra_snapshot_directories.results }}"
+        - files
+      register: compressed_snapshots_files
+
+    - name: Put compressed snapshots to S3
+      s3: 
+        bucket: "{{ backup_bucket }}"
+        region: "{{ ansible_ec2_placement_region }}"
+        access_key: "{{ specify_access_key }}"
+        secret_key: "{{ specify_secret_key }}"
+        src: "{{ item.dest }}"
+        object: "{{ ec2_tag_Name }}{{ item.dest }}"
+        mode: put
+      with_items: 
+        - "{{ compressed_snapshots_files.results }}"
+
